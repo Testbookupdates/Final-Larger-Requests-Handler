@@ -1,5 +1,8 @@
 "use strict";
 
+/* ======================================================
+   Imports
+====================================================== */
 const express = require("express");
 const crypto = require("crypto");
 const { Firestore } = require("@google-cloud/firestore");
@@ -8,66 +11,84 @@ const { CloudTasksClient } = require("@google-cloud/tasks");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
+/* ======================================================
+   App Init
+====================================================== */
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-/* =========================
-   ENV
-========================= */
-const {
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHANNEL_ID,
-  WEBENGAGE_LICENSE_CODE,
-  WEBENGAGE_API_KEY,
-  GCP_PROJECT,
-  GCP_LOCATION = "asia-south1",
-  TASKS_QUEUE = "final-larger-invite-queue-handler",
-  BASE_URL,
-  CLOUD_RUN_SERVICE_ACCOUNT, // REQUIRED for OIDC auth
-  PORT = 8080,
-} = process.env;
+/* ======================================================
+   ENV CONFIG
+====================================================== */
+const ENV = {
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "",
+  TELEGRAM_CHANNEL_ID: process.env.TELEGRAM_CHANNEL_ID || "",
+  WEBENGAGE_LICENSE_CODE: process.env.WEBENGAGE_LICENSE_CODE || "",
+  WEBENGAGE_API_KEY: process.env.WEBENGAGE_API_KEY || "",
+  GCP_PROJECT: process.env.GCP_PROJECT || "",
+  GCP_LOCATION: process.env.GCP_LOCATION || "asia-south1",
+  TASKS_QUEUE:
+    process.env.TASKS_QUEUE || "final-larger-invite-queue-handler",
+  BASE_URL: (process.env.BASE_URL || "").replace(/\/$/, ""),
+  CLOUD_RUN_SERVICE_ACCOUNT:
+    process.env.CLOUD_RUN_SERVICE_ACCOUNT || "",
+  PORT: process.env.PORT || 8080,
+};
 
-if (!BASE_URL) throw new Error("BASE_URL missing");
-if (!CLOUD_RUN_SERVICE_ACCOUNT)
-  throw new Error("CLOUD_RUN_SERVICE_ACCOUNT missing");
+console.log("=== STARTUP CONFIG ===");
+console.log(JSON.stringify(ENV, null, 2));
 
-/* =========================
-   Init
-========================= */
+/* ======================================================
+   Init Services
+====================================================== */
 const db = new Firestore();
 const tasks = new CloudTasksClient();
 
 const COL_REQ = "invite_requests";
 const COL_INV = "invite_lookup";
 
-const MAX_ATTEMPTS = 10; // reduced from 50
+const MAX_ATTEMPTS = 10;
 
-/* =========================
+/* ======================================================
    Utils
-========================= */
-const trace = (tag, msg, data) => {
-  console.log(`[${tag}] ${msg}`, data || "");
-};
+====================================================== */
+function trace(label, data) {
+  console.log(`[TRACE ${new Date().toISOString()}] ${label}`, data || "");
+}
 
-const sha256 = (s) =>
-  crypto.createHash("sha256").update(String(s)).digest("hex");
+function errorLog(label, err) {
+  console.error(`[ERROR ${new Date().toISOString()}] ${label}`, err);
+}
 
-const now = () => new Date().toISOString();
+function sha256(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
 
-const cleanBaseUrl = BASE_URL.replace(/\/$/, "");
+function now() {
+  return new Date().toISOString();
+}
 
-/* =========================
+/* ======================================================
+   Health Endpoint
+====================================================== */
+app.get("/", (req, res) => {
+  res.status(200).send("Service Healthy");
+});
+
+/* ======================================================
    WebEngage
-========================= */
+====================================================== */
 async function fireWebEngage(userId, eventName, eventData) {
   try {
-    const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
+    const url = `https://api.webengage.com/v1/accounts/${ENV.WEBENGAGE_LICENSE_CODE}/events`;
 
-    const res = await fetch(url, {
+    trace("WEBENGAGE → Sending", { userId, eventName });
+
+    const response = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${WEBENGAGE_API_KEY}`,
+        Authorization: `Bearer ${ENV.WEBENGAGE_API_KEY}`,
       },
       body: JSON.stringify({
         userId: String(userId),
@@ -76,52 +97,79 @@ async function fireWebEngage(userId, eventName, eventData) {
       }),
     });
 
-    return res.ok;
+    const text = await response.text();
+
+    trace("WEBENGAGE → Response", {
+      status: response.status,
+      ok: response.ok,
+      body: text,
+    });
+
+    return response.ok;
   } catch (err) {
-    console.error("WEBENGAGE ERROR:", err);
+    errorLog("WEBENGAGE FAILURE", err);
     return false;
   }
 }
 
-/* =========================
-   Cloud Tasks
-========================= */
+/* ======================================================
+   Cloud Tasks Enqueue
+====================================================== */
 async function enqueueWorker(requestId, delaySec = 0) {
-  const parent = tasks.queuePath(GCP_PROJECT, GCP_LOCATION, TASKS_QUEUE);
+  try {
+    if (!ENV.BASE_URL || !ENV.CLOUD_RUN_SERVICE_ACCOUNT) {
+      errorLog("TASK ENQUEUE FAILED", "Missing BASE_URL or SA");
+      return;
+    }
 
-  const task = {
-    httpRequest: {
-      httpMethod: "POST",
-      url: `${cleanBaseUrl}/v1/invite/worker`,
-      headers: { "Content-Type": "application/json" },
-      body: Buffer.from(JSON.stringify({ requestId })).toString("base64"),
-      oidcToken: {
-        serviceAccountEmail: CLOUD_RUN_SERVICE_ACCOUNT,
+    const parent = tasks.queuePath(
+      ENV.GCP_PROJECT,
+      ENV.GCP_LOCATION,
+      ENV.TASKS_QUEUE
+    );
+
+    const task = {
+      httpRequest: {
+        httpMethod: "POST",
+        url: `${ENV.BASE_URL}/v1/invite/worker`,
+        headers: { "Content-Type": "application/json" },
+        body: Buffer.from(JSON.stringify({ requestId })).toString(
+          "base64"
+        ),
+        oidcToken: {
+          serviceAccountEmail: ENV.CLOUD_RUN_SERVICE_ACCOUNT,
+        },
       },
-    },
-  };
-
-  if (delaySec > 0) {
-    task.scheduleTime = {
-      seconds: Math.floor(Date.now() / 1000) + delaySec,
     };
-  }
 
-  await tasks.createTask({ parent, task });
+    if (delaySec > 0) {
+      task.scheduleTime = {
+        seconds: Math.floor(Date.now() / 1000) + delaySec,
+      };
+    }
+
+    await tasks.createTask({ parent, task });
+
+    trace("TASK ENQUEUED", { requestId, delaySec });
+  } catch (err) {
+    errorLog("TASK CREATE ERROR", err);
+  }
 }
 
-/* =========================
-   Telegram
-========================= */
+/* ======================================================
+   Telegram Invite Creation
+====================================================== */
 async function createTelegramLink(name) {
   try {
+    trace("TELEGRAM → Creating Invite", name);
+
     const res = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`,
+      `https://api.telegram.org/bot${ENV.TELEGRAM_BOT_TOKEN}/createChatInviteLink`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          chat_id: TELEGRAM_CHANNEL_ID,
+          chat_id: ENV.TELEGRAM_CHANNEL_ID,
           member_limit: 1,
           name,
         }),
@@ -129,19 +177,23 @@ async function createTelegramLink(name) {
     );
 
     const json = await res.json();
+
+    trace("TELEGRAM → Response", json);
+
     return { ok: res.ok, json };
   } catch (err) {
-    console.error("TELEGRAM NETWORK ERROR:", err);
+    errorLog("TELEGRAM NETWORK ERROR", err);
     return { ok: false, json: null };
   }
 }
 
 /* ======================================================
-   1) CREATE INVITE REQUEST
+   1) Create Invite Request
 ====================================================== */
 app.post("/v1/invite/request", async (req, res) => {
   try {
     const { userId, transactionId = "" } = req.body;
+
     if (!userId)
       return res.status(400).json({ error: "Missing userId" });
 
@@ -155,56 +207,56 @@ app.post("/v1/invite/request", async (req, res) => {
       attempts: 0,
       createdAt: now(),
       updatedAt: now(),
-      weLinkEventFired: false,
-      joinEventFired: false,
+      error: null,
     });
+
+    trace("INVITE REQUEST CREATED", requestId);
 
     await enqueueWorker(requestId);
 
-    res.json({ ok: true, status: "queued", requestId });
+    res.json({ ok: true, requestId, status: "QUEUED" });
   } catch (err) {
-    console.error("REQUEST ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    errorLog("REQUEST ERROR", err);
+    res.status(500).json({ error: "Internal error" });
   }
 });
 
 /* ======================================================
-   2) WORKER
+   2) Worker
 ====================================================== */
 app.post("/v1/invite/worker", async (req, res) => {
   try {
     const { requestId } = req.body;
     if (!requestId) return res.status(400).send("Missing requestId");
 
+    trace("WORKER STARTED", requestId);
+
     const ref = db.collection(COL_REQ).doc(requestId);
     const snap = await ref.get();
-    if (!snap.exists) return res.send("ok");
+    if (!snap.exists) return res.send("No doc");
 
     const doc = snap.data();
 
     if (doc.status === "DONE" || doc.status === "FAILED")
-      return res.send("ok");
+      return res.send("Already processed");
 
     const attempts = doc.attempts + 1;
 
     if (attempts > MAX_ATTEMPTS) {
       await ref.update({ status: "FAILED", updatedAt: now() });
-      return res.send("max attempts reached");
+      return res.send("Max attempts reached");
     }
 
-    await ref.update({
-      status: "PROCESSING",
-      attempts,
-      updatedAt: now(),
-    });
+    await ref.update({ status: "PROCESSING", attempts });
 
-    const name = `uid:${doc.userId}|txn:${doc.transactionId}|rid:${requestId}|a:${attempts}`.slice(0, 255);
+    const name = `uid:${doc.userId}|rid:${requestId}|a:${attempts}`.slice(
+      0,
+      255
+    );
 
     const tg = await createTelegramLink(name);
 
     if (!tg.ok) {
-      console.error("TELEGRAM ERROR:", tg.json);
-
       if (tg.json?.error_code === 429) {
         const retryAfter =
           Number(tg.json?.parameters?.retry_after) || 10;
@@ -215,11 +267,10 @@ app.post("/v1/invite/worker", async (req, res) => {
         await ref.update({
           status: "FAILED",
           error: tg.json?.description || "telegram_error",
-          updatedAt: now(),
         });
       }
 
-      return res.send("handled telegram failure");
+      return res.send("Telegram handled");
     }
 
     const inviteLink = tg.json.result.invite_link;
@@ -229,7 +280,6 @@ app.post("/v1/invite/worker", async (req, res) => {
       inviteLink,
       requestId,
       userId: doc.userId,
-      transactionId: doc.transactionId,
       createdAt: now(),
     });
 
@@ -239,28 +289,27 @@ app.post("/v1/invite/worker", async (req, res) => {
       updatedAt: now(),
     });
 
-    if (!doc.weLinkEventFired) {
-      const ok = await fireWebEngage(
-        doc.userId,
-        "pass_paid_community_telegram_link_created",
-        {
-          transactionId: doc.transactionId,
-          inviteLink,
-        }
-      );
+    trace("INVITE CREATED SUCCESS", inviteLink);
 
-      await ref.update({ weLinkEventFired: ok });
-    }
+    const weOk = await fireWebEngage(
+      doc.userId,
+      "pass_paid_community_telegram_link_created",
+      { inviteLink }
+    );
 
-    res.send("success");
+    await ref.update({ weLinkEventFired: weOk });
+
+    trace("WEBENGAGE EVENT RESULT", weOk);
+
+    res.send("Worker success");
   } catch (err) {
-    console.error("WORKER ERROR:", err);
-    res.status(500).send("worker crashed");
+    errorLog("WORKER CRASH", err);
+    res.status(500).send("Worker failed");
   }
 });
 
 /* ======================================================
-   STATUS CHECK
+   Status Endpoint
 ====================================================== */
 app.get("/v1/invite/status/:requestId", async (req, res) => {
   try {
@@ -272,21 +321,16 @@ app.get("/v1/invite/status/:requestId", async (req, res) => {
     if (!snap.exists)
       return res.status(404).json({ error: "Not found" });
 
-    const data = snap.data();
-
-    res.json({
-      status: data.status,
-      inviteLink: data.inviteLink || null,
-      attempts: data.attempts,
-      error: data.error || null,
-    });
+    res.json(snap.data());
   } catch (err) {
-    console.error("STATUS ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    errorLog("STATUS ERROR", err);
+    res.status(500).json({ error: "Status failed" });
   }
 });
 
-/* ========================= */
-app.listen(PORT, () =>
-  trace("SYSTEM", `Listening on ${PORT}`)
-);
+/* ======================================================
+   Start Server
+====================================================== */
+app.listen(ENV.PORT, () => {
+  trace("SERVER STARTED", `Listening on port ${ENV.PORT}`);
+});
