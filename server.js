@@ -275,6 +275,38 @@ app.post("/v1/telegram/webhook", async (req, res) => {
   res.send("ok");
 });
 
+
+/* ======================================================
+   4) INVITE STATUS CHECK
+====================================================== */
+app.get("/v1/invite/status/:requestId", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+
+    const snap = await db
+      .collection(COL_REQ)
+      .doc(requestId)
+      .get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    const data = snap.data();
+
+    return res.json({
+      status: data.status,
+      inviteLink: data.inviteLink || null,
+      attempts: data.attempts
+    });
+
+  } catch (err) {
+    console.error("STATUS ERROR:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+
 /* ========================= */
 app.listen(PORT, () =>
   trace("SYSTEM", `Listening on ${PORT}`)
