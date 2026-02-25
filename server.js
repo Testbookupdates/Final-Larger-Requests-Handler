@@ -21,7 +21,7 @@ const {
   WEBENGAGE_API_KEY,
   GCP_PROJECT,
   GCP_LOCATION = "asia-south1",
-  TASKS_QUEUE = "tg-invite-queue",
+  TASKS_QUEUE = "final-larger-invite-queue-handler",
   BASE_URL,
   CLOUD_RUN_SERVICE_ACCOUNT, // REQUIRED for OIDC auth
   PORT = 8080,
