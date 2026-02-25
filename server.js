@@ -308,6 +308,76 @@ app.post("/v1/invite/worker", async (req, res) => {
   }
 });
 
+
+/* ======================================================
+   3) TELEGRAM WEBHOOK
+====================================================== */
+app.post("/v1/telegram/webhook", async (req, res) => {
+  try {
+    trace("TELEGRAM WEBHOOK RECEIVED", req.body);
+
+    const upd = req.body.chat_member || req.body.my_chat_member;
+    if (!upd) return res.send("ignored");
+
+    const inviteLink = upd?.invite_link?.invite_link;
+    const status = upd?.new_chat_member?.status;
+    const telegramUserId = upd?.new_chat_member?.user?.id;
+
+    if (
+      !inviteLink ||
+      !telegramUserId ||
+      !["member", "administrator", "creator"].includes(status)
+    ) {
+      return res.send("not a join event");
+    }
+
+    const inviteHash = sha256(inviteLink);
+
+    const linkSnap = await db
+      .collection(COL_INV)
+      .doc(inviteHash)
+      .get();
+
+    if (!linkSnap.exists) return res.send("orphan");
+
+    const { requestId } = linkSnap.data();
+
+    const reqRef = db.collection(COL_REQ).doc(requestId);
+    const reqSnap = await reqRef.get();
+
+    if (!reqSnap.exists) return res.send("no request");
+
+    const reqDoc = reqSnap.data();
+
+    if (reqDoc.joinEventFired)
+      return res.send("already processed");
+
+    const ok = await fireWebEngage(
+      reqDoc.userId,
+      "pass_paid_community_telegram_joined",
+      {
+        transactionId: reqDoc.transactionId,
+        inviteLink,
+        telegramUserId: String(telegramUserId),
+      }
+    );
+
+    await reqRef.update({
+      joinEventFired: ok,
+      telegramUserId,
+      joinedAt: now(),
+      updatedAt: now(),
+    });
+
+    trace("JOIN EVENT FIRED", { ok });
+
+    res.send("ok");
+  } catch (err) {
+    errorLog("WEBHOOK ERROR", err);
+    res.status(500).send("error");
+  }
+});
+
 /* ======================================================
    Status Endpoint
 ====================================================== */
